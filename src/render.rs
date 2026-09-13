@@ -1,31 +1,183 @@
 use std::sync::Arc;
+use wgpu::RenderPassDepthStencilAttachment;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ControlFlow, EventLoop},
-    window::Window,
+    window::{Window, WindowAttributes},
 };
 
-struct RenderState {
+pub struct Live2DDrawCall {
+    pub vertices: Vec<crate::model_interaction::Live2DVertex>,
+    pub indices: Vec<u16>,
+    pub texture_idx: i32,
+    pub blend_mode: i32,
+    pub render_order: i32,
+}
+
+struct State {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    size: winit::dpi::PhysicalSize<u32>,
     window: Arc<Window>,
+
+    pipelines: Live2DPipelines,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    texture_bind_groups: Vec<wgpu::BindGroup>,
+    uniform_bind_group: wgpu::BindGroup,
+    uniform_buffer: wgpu::Buffer,
 }
 
-impl RenderState {
+use serde::Deserialize;
+use std::fs::File;
+use std::path::Path;
+
+#[derive(Deserialize, Debug)]
+struct Model3Json {
+    #[serde(rename = "FileReferences")]
+    file_references: FileReferences,
+}
+
+#[derive(Deserialize, Debug)]
+struct FileReferences {
+    #[serde(rename = "Moc")]
+    moc: String,
+    #[serde(rename = "Textures")]
+    textures: Vec<String>,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Live2DUniforms {
+    pub projection: [f32; 16],
+    pub base_color: [f32; 4],
+}
+
+fn get_texture_paths(model_json_path: &str) -> Vec<String> {
+    let file = File::open(model_json_path).expect("Failed to open .model3.json");
+    let json: Model3Json = serde_json::from_reader(file).expect("Failed to parse JSON");
+
+    let base_dir = Path::new(model_json_path).parent().unwrap();
+
+    json.file_references
+        .textures
+        .iter()
+        .map(|tex_rel_path| base_dir.join(tex_rel_path).to_string_lossy().into_owned())
+        .collect()
+}
+
+fn load_texture_to_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    path: &str,
+) -> wgpu::BindGroup {
+    let img = image::open(path).expect(&format!("Failed to open texture: {}", path));
+    let rgba = img.to_rgba8();
+    let dimensions = rgba.dimensions();
+
+    let texture_size = wgpu::Extent3d {
+        width: dimensions.0,
+        height: dimensions.1,
+        depth_or_array_layers: 1,
+    };
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(path),
+        size: texture_size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb, // Соответствует формату RGBA8
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rgba,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * dimensions.0),
+            rows_per_image: Some(dimensions.1),
+        },
+        texture_size,
+    );
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(&format!("Bind Group for {}", path)),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
+impl State {
+    fn compute_projection_matrix(&self) -> [f32; 16] {
+        let window_aspect = self.size.width as f32 / self.size.height as f32;
+
+        let scale_x = 5.0;
+        let scale_y = 5.0;
+
+        let (final_scale_x, final_scale_y) = if window_aspect > 1.0 {
+            (1.0 / window_aspect, scale_y)
+        } else {
+            (scale_x, scale_y * window_aspect)
+        };
+
+        [
+            final_scale_x,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            final_scale_y,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ]
+    }
+
     async fn new(window: Window) -> Self {
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("Failed to get CARGO_MANIFEST_DIR");
+
         let window = Arc::new(window);
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::default();
 
-        let surface = instance.create_surface(window.clone()).unwrap();
+        let surface = instance.create_surface(Arc::clone(&window)).unwrap();
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
+                power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
@@ -35,9 +187,10 @@ impl RenderState {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    label: None,
+                    label: Some("Device Descriptor"),
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::default(),
                 },
                 None,
             )
@@ -55,8 +208,8 @@ impl RenderState {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: size.width.max(1),
-            height: size.height.max(1),
+            width: size.width,
+            height: size.height,
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
@@ -64,24 +217,161 @@ impl RenderState {
         };
         surface.configure(&device, &config);
 
+        let texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Live2D Texture Bind Group Layout"),
+                entries: &[
+                    // Текстура
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    // Сэмплер
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Live2D Texture Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let model_json = format!("{}/models/runtime/zundamon.model3.json", manifest_dir);
+        let paths = get_texture_paths(&model_json);
+
+        let texture_bind_groups = paths
+            .iter()
+            .map(|path| {
+                load_texture_to_bind_group(
+                    &device,
+                    &queue,
+                    &texture_bind_group_layout,
+                    &sampler,
+                    path,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let uniform_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Live2D Uniform Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Live2D Uniform Buffer"),
+            size: std::mem::size_of::<Live2DUniforms>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let initial_projection = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+
+        let uniforms = Live2DUniforms {
+            projection: initial_projection,
+            base_color: [1.0, 1.0, 1.0, 1.0],
+        };
+
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Live2D Uniform Bind Group"),
+            layout: &uniform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Live2D Pipeline Layout"),
+            bind_group_layouts: &[&uniform_bind_group_layout, &texture_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipelines = Live2DPipelines::new(&device, &pipeline_layout, surface_format);
+
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Live2D Dynamic Vertex Buffer"),
+            size: 10 * 1024 * 1024,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Live2D Dynamic Index Buffer"),
+            size: 2 * 1024 * 1024,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             surface,
             device,
             queue,
             config,
+            size,
             window,
+            pipelines,
+            vertex_buffer,
+            index_buffer,
+            texture_bind_groups: texture_bind_groups,
+            uniform_bind_group: uniform_bind_group,
+            uniform_buffer: uniform_buffer,
         }
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
+            self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+
+            let updated_projection = self.compute_projection_matrix();
+            let uniforms = Live2DUniforms {
+                projection: updated_projection,
+                base_color: [1.0, 1.0, 1.0, 1.0],
+            };
+
+            self.queue
+                .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         }
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        let draw_calls = unsafe { crate::model_interaction::process_live2d_frame() };
+
+        if draw_calls.is_empty() {
+            return Ok(());
+        }
+
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -89,28 +379,97 @@ impl RenderState {
 
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+
+        let vertex_size = std::mem::size_of::<crate::model_interaction::Live2DVertex>();
+        let index_size = std::mem::size_of::<u16>();
+
+        let mut all_vertices = Vec::new();
+        let mut all_indices = Vec::new();
+        let mut draw_call_offsets = Vec::new(); // Track where each draw call starts
+
+        let mut vertex_offset = 0u32;
+        let mut index_offset = 0u32;
+
+        for dc in &draw_calls {
+            draw_call_offsets.push((
+                vertex_offset,
+                index_offset,
+                dc.vertices.len(),
+                dc.indices.len(),
+            ));
+            all_vertices.extend_from_slice(&dc.vertices);
+            all_indices.extend_from_slice(&dc.indices);
+            vertex_offset += dc.vertices.len() as u32;
+            index_offset += dc.indices.len() as u32;
+        }
+
+        self.queue
+            .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&all_vertices));
+        self.queue
+            .write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&all_indices));
 
         {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::攻擊(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05,
+                            g: 0.05,
+                            b: 0.15,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                depth_stencil_attachment: None,
             });
+
+            for (dc_idx, (v_offset, i_offset, v_count, i_count)) in
+                draw_call_offsets.iter().enumerate()
+            {
+                let dc = &draw_calls[dc_idx];
+
+                match dc.blend_mode {
+                    1 => render_pass.set_pipeline(&self.pipelines.additive),
+                    2 => render_pass.set_pipeline(&self.pipelines.multiply),
+                    _ => render_pass.set_pipeline(&self.pipelines.normal),
+                }
+
+                if (dc.texture_idx as usize) < self.texture_bind_groups.len() {
+                    render_pass.set_bind_group(
+                        1,
+                        &self.texture_bind_groups[dc.texture_idx as usize],
+                        &[],
+                    );
+                }
+
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+
+                let vertex_byte_start = (*v_offset as u64) * (vertex_size as u64);
+                let vertex_byte_end =
+                    vertex_byte_start + ((*v_count as u64) * (vertex_size as u64));
+                render_pass.set_vertex_buffer(
+                    0,
+                    self.vertex_buffer.slice(vertex_byte_start..vertex_byte_end),
+                );
+
+                let index_byte_start = (*i_offset as u64) * (index_size as u64);
+                let index_byte_end = index_byte_start + ((*i_count as u64) * (index_size as u64));
+                render_pass.set_index_buffer(
+                    self.index_buffer.slice(index_byte_start..index_byte_end),
+                    wgpu::IndexFormat::Uint16,
+                );
+
+                render_pass.draw_indexed(0..*i_count as u32, 0, 0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -120,19 +479,132 @@ impl RenderState {
     }
 }
 
+pub struct Live2DPipelines {
+    pub normal: wgpu::RenderPipeline,
+    pub additive: wgpu::RenderPipeline,
+    pub multiply: wgpu::RenderPipeline,
+}
+
+impl Live2DPipelines {
+    pub fn new(
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        texture_format: wgpu::TextureFormat,
+    ) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Live2D Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/live2d.wgsl").into()),
+        });
+
+        let vertex_buffer_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<crate::model_interaction::Live2DVertex>()
+                as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2, // position
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2, // uv
+                },
+            ],
+        };
+
+        let create_pipeline = |label: &str, blend_state: wgpu::BlendState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[vertex_buffer_layout.clone()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: texture_format,
+                        blend: Some(blend_state),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+
+        let normal_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+
+        let additive_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+
+        let multiply_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+
+        Self {
+            normal: create_pipeline("Live2D Normal Pipeline", normal_blend),
+            additive: create_pipeline("Live2D Additive Pipeline", additive_blend),
+            multiply: create_pipeline("Live2D Multiply Pipeline", multiply_blend),
+        }
+    }
+}
+
 #[derive(Default)]
-struct App {
-    state: Option<RenderState>,
+pub struct App {
+    state: Option<State>,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.state.is_none() {
-            let window_attributes = Window::default_attributes().with_title("wgpu Window");
+            let window_attributes = WindowAttributes::default().with_title("Live2D wgpu Window");
             let window = event_loop.create_window(window_attributes).unwrap();
 
-            let render_state = pollster::block_on(RenderState::new(window));
-            self.state = Some(render_state);
+            let state = pollster::block_on(State::new(window));
+            self.state = Some(state);
         }
     }
 
@@ -142,8 +614,8 @@ impl ApplicationHandler for App {
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        let state = match &mut self.state {
-            Some(s) => s,
+        let state = match self.state.as_mut() {
+            Some(state) => state,
             None => return,
         };
 
@@ -153,16 +625,15 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(physical_size) => {
                 state.resize(physical_size);
-                state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
                 match state.render() {
                     Ok(_) => {}
-                    // Reconfigure the surface if it is lost (e.g., window resized drastically)
-                    Err(wgpu::SurfaceError::Lost) => state.resize(state.window.inner_size()),
+                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
                     Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
                     Err(e) => eprintln!("{:?}", e),
                 }
+                state.window.request_redraw();
             }
             _ => {}
         }
