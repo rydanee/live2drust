@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    ffi::CString,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 use wgpu::RenderPassDepthStencilAttachment;
 use winit::{
     application::ApplicationHandler,
@@ -13,9 +17,11 @@ pub struct Live2DDrawCall {
     pub texture_idx: i32,
     pub blend_mode: i32,
     pub render_order: i32,
+    pub opacity: f32,
 }
 
-struct State {
+pub struct State {
+    //util
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -23,17 +29,27 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     window: Arc<Window>,
 
+    //rendering
     pipelines: Live2DPipelines,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     texture_bind_groups: Vec<wgpu::BindGroup>,
     uniform_bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
+
+    //anims
+    shared_animation_state: animations::SharedAnimationState,
+    last_parameters_hash: Vec<(String, f32)>,
 }
 
 use serde::Deserialize;
 use std::fs::File;
 use std::path::Path;
+
+use crate::{
+    animations::{self, SharedAnimationState},
+    model_interaction,
+};
 
 #[derive(Deserialize, Debug)]
 struct Model3Json {
@@ -80,6 +96,8 @@ fn load_texture_to_bind_group(
     let rgba = img.to_rgba8();
     let dimensions = rgba.dimensions();
 
+    println!("Loading texture {} into VRAM.", path);
+
     let texture_size = wgpu::Extent3d {
         width: dimensions.0,
         height: dimensions.1,
@@ -92,7 +110,7 @@ fn load_texture_to_bind_group(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb, // Соответствует формату RGBA8
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -164,7 +182,7 @@ impl State {
         ]
     }
 
-    async fn new(window: Window) -> Self {
+    async fn new(window: Window, shared_frame: SharedAnimationState) -> Self {
         let manifest_dir =
             std::env::var("CARGO_MANIFEST_DIR").expect("Failed to get CARGO_MANIFEST_DIR");
 
@@ -253,6 +271,8 @@ impl State {
 
         let model_json = format!("{}/models/runtime/zundamon.model3.json", manifest_dir);
         let paths = get_texture_paths(&model_json);
+
+        println!("Found {} textures.", paths.len());
 
         let texture_bind_groups = paths
             .iter()
@@ -344,6 +364,9 @@ impl State {
             texture_bind_groups: texture_bind_groups,
             uniform_bind_group: uniform_bind_group,
             uniform_buffer: uniform_buffer,
+
+            shared_animation_state: shared_frame,
+            last_parameters_hash: vec![],
         }
     }
 
@@ -366,6 +389,23 @@ impl State {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        let frame_snapshot = {
+            let shared_data = self.shared_animation_state.current_frame.lock().unwrap();
+            shared_data.clone()
+        };
+
+        unsafe {
+            for (param_id, param_value) in &frame_snapshot.parameters {
+                let current_value = crate::model_interaction::getParameterValue(*param_id);
+
+                let blend_speed = 0.15f32;
+                let smoothed_value = current_value + (param_value - current_value) * blend_speed;
+
+                model_interaction::setParameterValue(*param_id, smoothed_value);
+            }
+            model_interaction::updateModel();
+        }
+
         let draw_calls = unsafe { crate::model_interaction::process_live2d_frame() };
 
         if draw_calls.is_empty() {
@@ -383,25 +423,28 @@ impl State {
                 label: Some("Render Encoder"),
             });
 
-        let vertex_size = std::mem::size_of::<crate::model_interaction::Live2DVertex>();
         let index_size = std::mem::size_of::<u16>();
 
         let mut all_vertices = Vec::new();
         let mut all_indices = Vec::new();
-        let mut draw_call_offsets = Vec::new(); // Track where each draw call starts
+        let mut draw_call_offsets = Vec::new();
 
         let mut vertex_offset = 0u32;
         let mut index_offset = 0u32;
 
         for dc in &draw_calls {
-            draw_call_offsets.push((
-                vertex_offset,
-                index_offset,
-                dc.vertices.len(),
-                dc.indices.len(),
-            ));
-            all_vertices.extend_from_slice(&dc.vertices);
+            draw_call_offsets.push((vertex_offset, index_offset, dc.indices.len() as u32));
+
+            for vertex in &dc.vertices {
+                all_vertices.push(crate::model_interaction::Live2DVertex {
+                    position: vertex.position,
+                    uv: vertex.uv,
+                    opacity: dc.opacity,
+                });
+            }
+
             all_indices.extend_from_slice(&dc.indices);
+
             vertex_offset += dc.vertices.len() as u32;
             index_offset += dc.indices.len() as u32;
         }
@@ -420,7 +463,7 @@ impl State {
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.05,
-                            g: 0.05,
+                            g: 0.10,
                             b: 0.15,
                             a: 1.0,
                         }),
@@ -432,9 +475,10 @@ impl State {
                 depth_stencil_attachment: None,
             });
 
-            for (dc_idx, (v_offset, i_offset, v_count, i_count)) in
-                draw_call_offsets.iter().enumerate()
-            {
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+
+            for (dc_idx, &(v_offset, i_offset, i_count)) in draw_call_offsets.iter().enumerate() {
                 let dc = &draw_calls[dc_idx];
 
                 match dc.blend_mode {
@@ -442,6 +486,8 @@ impl State {
                     2 => render_pass.set_pipeline(&self.pipelines.multiply),
                     _ => render_pass.set_pipeline(&self.pipelines.normal),
                 }
+
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
 
                 if (dc.texture_idx as usize) < self.texture_bind_groups.len() {
                     render_pass.set_bind_group(
@@ -451,24 +497,15 @@ impl State {
                     );
                 }
 
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                let index_byte_start = (i_offset as u64) * (index_size as u64);
+                let index_byte_end = index_byte_start + ((i_count as u64) * (index_size as u64));
 
-                let vertex_byte_start = (*v_offset as u64) * (vertex_size as u64);
-                let vertex_byte_end =
-                    vertex_byte_start + ((*v_count as u64) * (vertex_size as u64));
-                render_pass.set_vertex_buffer(
-                    0,
-                    self.vertex_buffer.slice(vertex_byte_start..vertex_byte_end),
-                );
-
-                let index_byte_start = (*i_offset as u64) * (index_size as u64);
-                let index_byte_end = index_byte_start + ((*i_count as u64) * (index_size as u64));
                 render_pass.set_index_buffer(
                     self.index_buffer.slice(index_byte_start..index_byte_end),
                     wgpu::IndexFormat::Uint16,
                 );
 
-                render_pass.draw_indexed(0..*i_count as u32, 0, 0..1);
+                render_pass.draw_indexed(0..i_count, v_offset as i32, 0..1);
             }
         }
 
@@ -498,7 +535,7 @@ impl Live2DPipelines {
 
         let vertex_buffer_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<crate::model_interaction::Live2DVertex>()
-                as wgpu::BufferAddress,
+                as wgpu::BufferAddress, // 20
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
@@ -507,9 +544,14 @@ impl Live2DPipelines {
                     format: wgpu::VertexFormat::Float32x2, // position
                 },
                 wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                    offset: 8,
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x2, // uv
+                },
+                wgpu::VertexAttribute {
+                    offset: 16,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32, // opacity
                 },
             ],
         };
@@ -547,7 +589,7 @@ impl Live2DPipelines {
 
         let normal_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
+                src_factor: wgpu::BlendFactor::SrcAlpha,
                 dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                 operation: wgpu::BlendOperation::Add,
             },
@@ -594,7 +636,8 @@ impl Live2DPipelines {
 
 #[derive(Default)]
 pub struct App {
-    state: Option<State>,
+    pub state: Option<State>,
+    pub shared_anim_state: SharedAnimationState,
 }
 
 impl ApplicationHandler for App {
@@ -603,7 +646,9 @@ impl ApplicationHandler for App {
             let window_attributes = WindowAttributes::default().with_title("Live2D wgpu Window");
             let window = event_loop.create_window(window_attributes).unwrap();
 
-            let state = pollster::block_on(State::new(window));
+            let shared_frame = self.shared_anim_state.clone();
+
+            let state = pollster::block_on(State::new(window, shared_frame));
             self.state = Some(state);
         }
     }

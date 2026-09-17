@@ -1,7 +1,13 @@
 use bytemuck::{Pod, Zeroable};
-use std::ffi::{CString, c_char, c_float, c_int, c_ushort};
+use std::{
+    ffi::{CStr, CString, c_char, c_float, c_int, c_ushort},
+    path::Path,
+    str::FromStr,
+    thread,
+    time::Duration,
+};
 
-use crate::render::Live2DDrawCall;
+use crate::{animations, render::Live2DDrawCall};
 
 #[link(name = "interaction", kind = "static")]
 unsafe extern "C" {
@@ -18,6 +24,16 @@ unsafe extern "C" {
         indices: *mut *const c_ushort,
     );
     fn getDrawableBlendingState(index: c_int) -> c_int;
+    pub fn updateModel();
+    pub fn getParameterCount() -> c_int;
+    pub fn getParameterIds() -> *const *const c_char;
+    pub fn getParameterValue(id: c_int) -> c_float;
+    pub fn setParameterValue(id: c_int, value: c_float);
+    fn getPartCount() -> c_int;
+    fn getPartIds() -> *const *const c_char;
+    fn getPartOpacity(id: c_int) -> c_float;
+    fn getDrawableOpacity(index: c_int) -> c_float;
+    pub fn getParameterId(name: *const c_char) -> c_int;
 }
 
 #[repr(C)]
@@ -25,13 +41,14 @@ unsafe extern "C" {
 pub struct Live2DVertex {
     pub position: [f32; 2],
     pub uv: [f32; 2],
+    pub opacity: f32,
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
 pub unsafe fn process_live2d_frame() -> Vec<Live2DDrawCall> {
     let count = getDrawablesCount();
 
-    println!("Drawable count: {}", count);
+    //println!("Drawable count: {}", count);
 
     if count <= 0 || count > 5000 {
         return Vec::new();
@@ -43,6 +60,7 @@ pub unsafe fn process_live2d_frame() -> Vec<Live2DDrawCall> {
         let texture_idx = getDrawableTexIndices(i);
         let blending = getDrawableBlendingState(i);
         let render_order = getDrawableRenderingOrder(i);
+        let opacity = getDrawableOpacity(i);
 
         let mut v_count: c_int = 0;
         let mut i_count: c_int = 0;
@@ -86,18 +104,9 @@ pub unsafe fn process_live2d_frame() -> Vec<Live2DDrawCall> {
         for idx in 0..v_count as usize {
             vertices.push(Live2DVertex {
                 position: [positions_vec[idx * 2], positions_vec[idx * 2 + 1]],
-                uv: [uvs_vec[idx * 2], uvs_vec[idx * 2 + 1]],
+                uv: [uvs_vec[idx * 2], 1.0 - uvs_vec[idx * 2 + 1]],
+                opacity: opacity,
             });
-        }
-        if i == 0 && !vertices.is_empty() {
-            println!(
-                "Raw vertex 0: pos=({:.3}, {:.3}), uv=({:.3}, {:.3})",
-                vertices[0].position[0],
-                vertices[0].position[1],
-                vertices[0].uv[0],
-                vertices[0].uv[1]
-            );
-            println!("Vertex count: {}, Index count: {}", v_count, i_count);
         }
 
         draw_calls.push(Live2DDrawCall {
@@ -106,14 +115,60 @@ pub unsafe fn process_live2d_frame() -> Vec<Live2DDrawCall> {
             texture_idx,
             blend_mode: blending,
             render_order,
+            opacity: opacity,
         });
     }
 
-    println!("Total draw calls created: {}", draw_calls.len());
+    //println!("Total draw calls created: {}", draw_calls.len());
 
     draw_calls.sort_by_key(|dc| dc.render_order);
 
     draw_calls
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn get_pm_ids() -> Vec<String> {
+    let ids_count = getParameterCount();
+    let mut res: Vec<String> = vec![];
+
+    println!("{}", ids_count);
+
+    let ids_ptr: *const *const c_char = getParameterIds();
+
+    let ids_slice: &[*const c_char] = std::slice::from_raw_parts(ids_ptr, ids_count as usize);
+
+    for (i, &ptr) in ids_slice.iter().enumerate() {
+        if !ptr.is_null() {
+            let c_str = CStr::from_ptr(ptr);
+
+            match c_str.to_str() {
+                Ok(str_slice) => res.push(String::from_str(str_slice).unwrap()),
+                Err(e) => eprintln!("{}", e),
+            }
+        }
+    }
+
+    res
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn get_pr_ids() {
+    let count = getPartCount();
+
+    let ids_ptr: *const *const c_char = getPartIds();
+
+    let ids_slice: &[*const c_char] = std::slice::from_raw_parts(ids_ptr, count as usize);
+
+    for (i, &ptr) in ids_slice.iter().enumerate() {
+        if !ptr.is_null() {
+            let c_str = CStr::from_ptr(ptr);
+            let value = getPartOpacity(i as i32);
+            match c_str.to_str() {
+                Ok(str_slice) => println!("{} ID: {} : {}", i, str_slice, value),
+                Err(e) => eprintln!("{}", e),
+            }
+        }
+    }
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -123,4 +178,6 @@ pub unsafe fn init_model() {
     let cman = CString::new(manifest_dir).expect("");
 
     init(cman.as_ptr());
+
+    //animations::play_anim(anim);
 }
