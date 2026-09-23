@@ -18,6 +18,8 @@ pub struct Live2DDrawCall {
     pub blend_mode: i32,
     pub render_order: i32,
     pub opacity: f32,
+    pub masks: Vec<i32>,
+    pub source_index: i32,
 }
 
 pub struct State {
@@ -36,10 +38,15 @@ pub struct State {
     texture_bind_groups: Vec<wgpu::BindGroup>,
     uniform_bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
+    all_indices: Vec<u16>,
+    all_vertices: Vec<crate::model_interaction::Live2DVertex>,
+    draw_call_offsets: Vec<(u32, u32, u32)>,
 
     //anims
-    shared_animation_state: animations::SharedAnimationState,
     last_parameters_hash: Vec<(String, f32)>,
+
+    //masks
+    depth_stencil_view: wgpu::TextureView,
 }
 
 use serde::Deserialize;
@@ -182,7 +189,7 @@ impl State {
         ]
     }
 
-    async fn new(window: Window, shared_frame: SharedAnimationState) -> Self {
+    async fn new(window: Window) -> Self {
         let manifest_dir =
             std::env::var("CARGO_MANIFEST_DIR").expect("Failed to get CARGO_MANIFEST_DIR");
 
@@ -351,6 +358,23 @@ impl State {
             mapped_at_creation: false,
         });
 
+        let depth_stencil_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Live2D Depth Stencil Texture"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth24PlusStencil8,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_stencil_view =
+            depth_stencil_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         Self {
             surface,
             device,
@@ -365,8 +389,12 @@ impl State {
             uniform_bind_group: uniform_bind_group,
             uniform_buffer: uniform_buffer,
 
-            shared_animation_state: shared_frame,
             last_parameters_hash: vec![],
+
+            depth_stencil_view: depth_stencil_view,
+            all_indices: Vec::new(),
+            all_vertices: Vec::new(),
+            draw_call_offsets: Vec::new(),
         }
     }
 
@@ -383,6 +411,24 @@ impl State {
                 base_color: [1.0, 1.0, 1.0, 1.0],
             };
 
+            let depth_stencil_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Live2D Depth Stencil Texture (Resize)"),
+                size: wgpu::Extent3d {
+                    width: new_size.width,
+                    height: new_size.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth24PlusStencil8,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+
+            self.depth_stencil_view =
+                depth_stencil_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
             self.queue
                 .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         }
@@ -390,17 +436,15 @@ impl State {
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let frame_snapshot = {
-            let shared_data = self.shared_animation_state.current_frame.lock().unwrap();
+            let shared_data = animations::anim_state.current_frame.lock().unwrap();
             shared_data.clone()
         };
 
         unsafe {
             for (param_id, param_value) in &frame_snapshot.parameters {
                 let current_value = crate::model_interaction::getParameterValue(*param_id);
-
                 let blend_speed = 0.15f32;
                 let smoothed_value = current_value + (param_value - current_value) * blend_speed;
-
                 model_interaction::setParameterValue(*param_id, smoothed_value);
             }
             model_interaction::updateModel();
@@ -424,10 +468,9 @@ impl State {
             });
 
         let index_size = std::mem::size_of::<u16>();
-
-        let mut all_vertices = Vec::new();
-        let mut all_indices = Vec::new();
-        let mut draw_call_offsets = Vec::new();
+        let mut all_vertices = &mut self.all_vertices;
+        let mut all_indices = &mut self.all_indices;
+        let mut draw_call_offsets = &mut self.draw_call_offsets;
 
         let mut vertex_offset = 0u32;
         let mut index_offset = 0u32;
@@ -456,7 +499,7 @@ impl State {
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+                label: Some("Live2D Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -472,7 +515,17 @@ impl State {
                 })],
                 timestamp_writes: None,
                 occlusion_query_set: None,
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_stencil_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                }),
             });
 
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
@@ -481,10 +534,47 @@ impl State {
             for (dc_idx, &(v_offset, i_offset, i_count)) in draw_call_offsets.iter().enumerate() {
                 let dc = &draw_calls[dc_idx];
 
-                match dc.blend_mode {
-                    1 => render_pass.set_pipeline(&self.pipelines.additive),
-                    2 => render_pass.set_pipeline(&self.pipelines.multiply),
-                    _ => render_pass.set_pipeline(&self.pipelines.normal),
+                if dc.opacity <= 0.001 {
+                    continue;
+                }
+
+                if !dc.masks.is_empty() {
+                    let mut any_mask_drawn: bool = false;
+
+                    render_pass.set_pipeline(&self.pipelines.mask_write);
+                    render_pass.set_stencil_reference(0);
+                    for &mask_id in &dc.masks {
+                        if let Some(mask_idx) =
+                            draw_calls.iter().position(|x| x.source_index == mask_id)
+                        {
+                            let &(m_v_offset, m_i_offset, m_i_count) = &draw_call_offsets[mask_idx];
+                            let m_i_start = (m_i_offset as u64) * (index_size as u64);
+                            let m_i_end = m_i_start + ((m_i_count as u64) * (index_size as u64));
+                            render_pass.set_index_buffer(
+                                self.index_buffer.slice(m_i_start..m_i_end),
+                                wgpu::IndexFormat::Uint16,
+                            );
+                            render_pass.draw_indexed(0..m_i_count, m_v_offset as i32, 0..1);
+                            any_mask_drawn = false;
+                        }
+                    }
+
+                    if any_mask_drawn {
+                        render_pass.set_pipeline(&self.pipelines.mask_read);
+                        render_pass.set_stencil_reference(1);
+                    } else {
+                        match dc.blend_mode {
+                            1 => render_pass.set_pipeline(&self.pipelines.additive),
+                            2 => render_pass.set_pipeline(&self.pipelines.multiply),
+                            _ => render_pass.set_pipeline(&self.pipelines.normal),
+                        }
+                    }
+                } else {
+                    match dc.blend_mode {
+                        1 => render_pass.set_pipeline(&self.pipelines.additive),
+                        2 => render_pass.set_pipeline(&self.pipelines.multiply),
+                        _ => render_pass.set_pipeline(&self.pipelines.normal),
+                    }
                 }
 
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -512,6 +602,10 @@ impl State {
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
+        all_vertices.clear();
+        all_indices.clear();
+        draw_call_offsets.clear();
+
         Ok(())
     }
 }
@@ -520,6 +614,8 @@ pub struct Live2DPipelines {
     pub normal: wgpu::RenderPipeline,
     pub additive: wgpu::RenderPipeline,
     pub multiply: wgpu::RenderPipeline,
+    pub mask_write: wgpu::RenderPipeline,
+    pub mask_read: wgpu::RenderPipeline,
 }
 
 impl Live2DPipelines {
@@ -556,36 +652,45 @@ impl Live2DPipelines {
             ],
         };
 
-        let create_pipeline = |label: &str, blend_state: wgpu::BlendState| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: "vs_main",
-                    buffers: &[vertex_buffer_layout.clone()],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: texture_format,
-                        blend: Some(blend_state),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            })
+        let default_depth_stencil = wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24PlusStencil8,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
         };
+
+        let create_pipeline =
+            |label: &str, blend_state: wgpu::BlendState, depth_stencil: wgpu::DepthStencilState| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: "vs_main",
+                        buffers: &[vertex_buffer_layout.clone()],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: "fs_main",
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: texture_format,
+                            blend: Some(blend_state),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(depth_stencil),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                })
+            };
 
         let normal_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
@@ -626,10 +731,91 @@ impl Live2DPipelines {
             },
         };
 
+        let mask_write_stencil = wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24PlusStencil8,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState {
+                front: wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Always,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::Replace,
+                },
+                back: wgpu::StencilFaceState::default(),
+                read_mask: 0xFF,
+                write_mask: 0xFF,
+            },
+            bias: wgpu::DepthBiasState::default(),
+        };
+
+        let mask_write = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Live2D Mask Write Pipeline"),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[vertex_buffer_layout.clone()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: texture_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: Some(mask_write_stencil),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let mask_read_stencil = wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24PlusStencil8,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState {
+                front: wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Equal,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::Zero,
+                },
+                back: wgpu::StencilFaceState::default(),
+                read_mask: 0xFF,
+                write_mask: 0xFF,
+            },
+            bias: wgpu::DepthBiasState::default(),
+        };
+
+        let mask_read = create_pipeline("Live2D Mask Read", normal_blend, mask_read_stencil);
+
         Self {
-            normal: create_pipeline("Live2D Normal Pipeline", normal_blend),
-            additive: create_pipeline("Live2D Additive Pipeline", additive_blend),
-            multiply: create_pipeline("Live2D Multiply Pipeline", multiply_blend),
+            normal: create_pipeline(
+                "Live2D Normal Pipeline",
+                normal_blend,
+                default_depth_stencil.clone(),
+            ),
+            additive: create_pipeline(
+                "Live2D Additive Pipeline",
+                additive_blend,
+                default_depth_stencil.clone(),
+            ),
+            multiply: create_pipeline(
+                "Live2D Multiply Pipeline",
+                multiply_blend,
+                default_depth_stencil.clone(),
+            ),
+            mask_write,
+            mask_read,
         }
     }
 }
@@ -637,7 +823,6 @@ impl Live2DPipelines {
 #[derive(Default)]
 pub struct App {
     pub state: Option<State>,
-    pub shared_anim_state: SharedAnimationState,
 }
 
 impl ApplicationHandler for App {
@@ -646,9 +831,7 @@ impl ApplicationHandler for App {
             let window_attributes = WindowAttributes::default().with_title("Live2D wgpu Window");
             let window = event_loop.create_window(window_attributes).unwrap();
 
-            let shared_frame = self.shared_anim_state.clone();
-
-            let state = pollster::block_on(State::new(window, shared_frame));
+            let state = pollster::block_on(State::new(window));
             self.state = Some(state);
         }
     }
@@ -679,6 +862,24 @@ impl ApplicationHandler for App {
                     Err(e) => eprintln!("{:?}", e),
                 }
                 state.window.request_redraw();
+            }
+            WindowEvent::CursorMoved {
+                device_id,
+                position,
+            } => {
+                // self.shared_anim_state
+                //     .current_frame
+                //     .lock()
+                //     .unwrap()
+                //     .parameters = vec![
+                //     (71, (position.x / 100.0) as f32),
+                //     (87, (position.x / 100.0) as f32),
+                //     (0, (position.x / 22.0) as f32),
+                //     (1, (position.y / -25.0) as f32 + 30.0),
+                //     (2, (position.x / 50.0) as f32),
+                //     (20, (position.x / 900.0) as f32),
+                //     (21, (position.y / 1200.0) as f32 - 0.5),
+                // ];
             }
             _ => {}
         }

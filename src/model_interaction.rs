@@ -34,6 +34,18 @@ unsafe extern "C" {
     fn getPartOpacity(id: c_int) -> c_float;
     fn getDrawableOpacity(index: c_int) -> c_float;
     pub fn getParameterId(name: *const c_char) -> c_int;
+    pub fn getMasksCount(idx: c_int) -> c_int;
+    pub fn getMasks(idx: c_int) -> *const c_int;
+    pub fn isDrawableVisible(idx: c_int) -> c_int;
+    pub fn getDrawableParentPartIndex(idx: c_int) -> c_int;
+    pub fn setPartOpacity(idx: c_int, val: c_float);
+}
+
+pub fn c_char_ptr(val: &str) -> *const i8 {
+    let c_str = CString::new(val).unwrap();
+    let ptr: *const i8 = c_str.as_ptr();
+
+    return ptr;
 }
 
 #[repr(C)]
@@ -42,6 +54,14 @@ pub struct Live2DVertex {
     pub position: [f32; 2],
     pub uv: [f32; 2],
     pub opacity: f32,
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn get_parameter_id(name: &str) -> i32 {
+    let raw = CString::new(name).unwrap();
+    let ptr = raw.as_ptr();
+
+    return getParameterId(ptr);
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -57,10 +77,15 @@ pub unsafe fn process_live2d_frame() -> Vec<Live2DDrawCall> {
     let mut draw_calls = Vec::with_capacity(count as usize);
 
     for i in 0..count {
+        let is_visible = isDrawableVisible(i);
+        if is_visible == 0 {
+            continue;
+        }
+
         let texture_idx = getDrawableTexIndices(i);
         let blending = getDrawableBlendingState(i);
         let render_order = getDrawableRenderingOrder(i);
-        let opacity = getDrawableOpacity(i);
+        let mut opacity = getDrawableOpacity(i);
 
         let mut v_count: c_int = 0;
         let mut i_count: c_int = 0;
@@ -86,6 +111,18 @@ pub unsafe fn process_live2d_frame() -> Vec<Live2DDrawCall> {
             continue;
         }
 
+        // -- MASKS --
+        let mask_count = getMasksCount(i) as usize;
+        let mut masks = vec![];
+
+        if mask_count > 0 {
+            let mask_ptr = getMasks(i);
+            let mask_slice = std::slice::from_raw_parts(mask_ptr, mask_count);
+            masks = mask_slice.to_vec();
+        }
+
+        // -- ETC --
+
         let positions = std::slice::from_raw_parts(pos_ptr, (v_count * 2) as usize);
         let uvs = std::slice::from_raw_parts(uv_ptr, (v_count * 2) as usize);
         let indices = std::slice::from_raw_parts(idx_ptr, i_count as usize);
@@ -99,6 +136,23 @@ pub unsafe fn process_live2d_frame() -> Vec<Live2DDrawCall> {
                 indices_vec.push(last);
             }
         }
+
+        // -- EYES --
+
+        let eye_l_val = getParameterValue(get_parameter_id("ParamEyeLOpen"));
+        let eye_r_val = getParameterValue(get_parameter_id("ParamEyeROpen"));
+
+        if mask_count > 0 {
+            if eye_l_val < 0.06 && eye_r_val < 0.06 {
+                opacity = 0.0;
+            }
+        }
+
+        if opacity <= 0.01 {
+            continue;
+        }
+
+        // -- ETC --
 
         let mut vertices = Vec::with_capacity(v_count as usize);
         for idx in 0..v_count as usize {
@@ -116,13 +170,14 @@ pub unsafe fn process_live2d_frame() -> Vec<Live2DDrawCall> {
             blend_mode: blending,
             render_order,
             opacity: opacity,
+            masks: masks,
+            source_index: i as i32,
         });
     }
 
     //println!("Total draw calls created: {}", draw_calls.len());
 
     draw_calls.sort_by_key(|dc| dc.render_order);
-
     draw_calls
 }
 
@@ -142,7 +197,10 @@ pub unsafe fn get_pm_ids() -> Vec<String> {
             let c_str = CStr::from_ptr(ptr);
 
             match c_str.to_str() {
-                Ok(str_slice) => res.push(String::from_str(str_slice).unwrap()),
+                Ok(str_slice) => {
+                    res.push(String::from_str(str_slice).unwrap());
+                    println!("{} ID: {}", i, str_slice);
+                }
                 Err(e) => eprintln!("{}", e),
             }
         }
@@ -179,5 +237,5 @@ pub unsafe fn init_model() {
 
     init(cman.as_ptr());
 
-    //animations::play_anim(anim);
+    get_pm_ids();
 }

@@ -5,7 +5,8 @@
 #include <fstream>
 #include <iostream>
 
-extern "C" {
+extern "C"
+{
 
   void *mocMemory;
   void *modelMemory;
@@ -19,12 +20,14 @@ extern "C" {
 
   void errPrint(const char *message) { printf("[ERR] %s\n", message); }
 
-  void *AllocateAligned(size_t size, size_t alignment) {
+  void *AllocateAligned(size_t size, size_t alignment)
+  {
 #if defined(_MSC_VER) || defined(__MINGW32__)
     return _aligned_malloc(size, alignment);
 #else
     void *pointer = nullptr;
-    if (posix_memalign(&pointer, alignment, size) != 0) {
+    if (posix_memalign(&pointer, alignment, size) != 0)
+    {
       return nullptr;
     }
     return pointer;
@@ -32,9 +35,11 @@ extern "C" {
   }
 
   void *ReadBlobAligned(const char *filePath, size_t alignment,
-                        unsigned int *outSize) {
+                        unsigned int *outSize)
+  {
     std::ifstream file(filePath, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
+    if (!file.is_open())
+    {
       errPrint("Failed to open file: ");
       errPrint(filePath);
       return nullptr;
@@ -43,17 +48,20 @@ extern "C" {
     std::streamsize size = file.tellg();
     file.seekg(0, std::ios::beg);
 
-    if (outSize) {
+    if (outSize)
+    {
       *outSize = static_cast<unsigned int>(size);
     }
 
     void *alignedBuffer = AllocateAligned(static_cast<size_t>(size), alignment);
-    if (!alignedBuffer) {
+    if (!alignedBuffer)
+    {
       errPrint("Memory allocation failed.");
       return nullptr;
     }
 
-    if (!file.read(static_cast<char *>(alignedBuffer), size)) {
+    if (!file.read(static_cast<char *>(alignedBuffer), size))
+    {
       errPrint("Failed to read file data.");
       return nullptr;
     }
@@ -61,43 +69,70 @@ extern "C" {
     return alignedBuffer;
   }
 
-  void updateModel() {
-    if (!model) return;
-    csmUpdateModel(model);
+  void updateModel()
+  {
+    if (!model)
+      return;
+    if (csmOpacityDidChange || csmDrawOrderDidChange || csmRenderOrderDidChange || csmVertexPositionsDidChange || csmBlendColorDidChange)
+      csmUpdateModel(model);
   }
-  
+
   // ---- DRAWABLES ----
-  
-  int getDrawablesCount() {
+
+  int getDrawablesCount()
+  {
     int drawableCount = csmGetDrawableCount(model);
     return drawableCount;
   }
 
-  int getDrawableTexIndices(int drawableIndex) {
+  int getDrawableTexIndices(int drawableIndex)
+  {
     return csmGetDrawableTextureIndices(model)[drawableIndex];
   }
 
-  int getDrawableRenderingOrder(int drawableIndex) {
-    return csmGetDrawableDrawOrders(model)[drawableIndex];
+  int getDrawableRenderingOrder(int drawableIndex)
+  {
+    return csmGetRenderOrders(model)[drawableIndex];
   }
 
-  int getDrawableBlendingState(int drawableIndex) {
+  int getDrawableBlendingState(int drawableIndex)
+  {
     unsigned int flags = csmGetDrawableConstantFlags(model)[drawableIndex];
 
-    if (flags & csmBlendAdditive) return 1;
-    if (flags & csmBlendMultiplicative) return 2;
-    
+    if (flags & csmBlendAdditive)
+      return 1;
+    if (flags & csmBlendMultiplicative)
+      return 2;
+
     return 0;
   }
 
-  float getDrawableOpacity(int drawableIndex) {
+  float getDrawableOpacity(int drawableIndex)
+  {
     return csmGetDrawableOpacities(model)[drawableIndex];
   }
-  
+
+  int isDrawableVisible(int idx)
+  {
+    const unsigned char flags = csmGetDrawableDynamicFlags(model)[idx];
+
+    if (flags & csmIsVisible)
+    {
+      return 1;
+    }
+    return 0;
+  }
+
+  int getDrawableParentPartIndex(int idx)
+  {
+    return csmGetDrawableParentPartIndices(model)[idx];
+  }
+
   void getDrawableGeometry(int drawableIndex, int *outVertexCount,
                            const float **outPositions, const float **outUvs,
                            int *outIndexCount,
-                           const unsigned short **outIndices) {
+                           const unsigned short **outIndices)
+  {
 
     *outVertexCount = csmGetDrawableVertexCounts(model)[drawableIndex];
     *outIndexCount = csmGetDrawableIndexCounts(model)[drawableIndex];
@@ -106,64 +141,98 @@ extern "C" {
     *outUvs = (const float *)csmGetDrawableVertexUvs(model)[drawableIndex];
     *outIndices = csmGetDrawableIndices(model)[drawableIndex];
   }
-  
+
   // ---- PARAMETERS ----
-  
-  int getParameterCount() {
+
+  int getParameterCount()
+  {
     return csmGetParameterCount(model);
   }
 
-  const char** getParameterIds() {
+  const char **getParameterIds()
+  {
     return csmGetParameterIds(model);
   }
 
-  float getParameterValue(int id) {
+  float getParameterValue(int id)
+  {
+    if (!model)
+      return 0.0f;
     return csmGetParameterValues(model)[id];
   }
 
-  int getParameterId(const char* name) {
+  int getParameterId(const char *name)
+  {
+    if (!model)
+      return -1;
+
     int id = 0;
     const char **ptr = getParameterIds();
 
-    while (*ptr != nullptr && std::strcmp(*ptr, name) != 0) {
+    while (*ptr != nullptr && std::strcmp(*ptr, name) != 0)
+    {
       ptr++;
       id++;
     }
 
-    if (std::strcmp(*ptr, name) != 0) {
+    if (std::strcmp(*ptr, name) != 0)
+    {
       return -1;
     }
-    
+
     return id;
   }
-  
-  void setParameterValue(int id, const float value) {
+
+  void setParameterValue(int id, const float value)
+  {
     int count = getParameterCount();
-    float * values = csmGetParameterValues(model);
+    float *values = csmGetParameterValues(model);
 
     values[id] = value;
   }
-  
+
+  // ---- MASKS ----
+
+  int getMasksCount(int idx)
+  {
+    return csmGetDrawableMaskCounts(model)[idx];
+  }
+
+  const int *getMasks(int idx)
+  {
+    return csmGetDrawableMasks(model)[idx];
+  }
+
   // ---- PARTS ----
-  
-  int getPartCount() {
+
+  int getPartCount()
+  {
     return csmGetPartCount(model);
   }
 
-  const char** getPartIds() {
+  const char **getPartIds()
+  {
     return csmGetPartIds(model);
   }
-  
-  float getPartOpacity(int id) {
+
+  float getPartOpacity(int id)
+  {
     return csmGetPartOpacities(model)[id];
   }
 
+  void setPartOpacity(int id, float val)
+  {
+    float *list = csmGetPartOpacities(model);
+    list[id] = val;
+  }
+
   // ---- LOADING ----
-  
-  int load_model() {
+
+  int load_model()
+  {
     mocMemory = ReadBlobAligned(
-      (cargo_manifest + "/models/runtime/zundamon.moc3").c_str(), csmAlignofMoc,
-      &mocSize);
+        (cargo_manifest + "/models/runtime/zundamon.moc3").c_str(), csmAlignofMoc,
+        &mocSize);
     logPrint("Loaded moc3 model.");
     moc = csmReviveMocInPlace(mocMemory, mocSize);
     modelSize = csmGetSizeofModel(moc);
@@ -184,7 +253,8 @@ extern "C" {
     return 0;
   }
 
-  void init(const char *project_dir) {
+  void init(const char *project_dir)
+  {
     csmSetLogFunction(logPrint);
     cargo_manifest = project_dir;
     load_model();

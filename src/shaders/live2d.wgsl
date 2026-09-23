@@ -32,7 +32,11 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let tex_color = textureSample(t_texture, s_sampler, in.uv);
+  let tex_color = textureSample(t_texture, s_sampler, in.uv);
     
-    return tex_color * uniforms.base_color * in.opacity;
+  if (tex_color.a < 0.1) {
+    discard;
+  }
+    
+  return tex_color * uniforms.base_color * in.opacity;
 }

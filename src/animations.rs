@@ -4,14 +4,25 @@ use std::{
     io::BufReader,
     path::Path,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     thread,
     time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::model_interaction::{self, getParameterId, setParameterValue};
+use crate::{
+    model_interaction::{self, getParameterId, setParameterValue},
+    physics::{self, runtime},
+};
+
+pub static anim_state: LazyLock<Arc<SharedAnimationState>> = LazyLock::new(|| {
+    let state = SharedAnimationState {
+        current_frame: Arc::new(Mutex::new(AnimationFrameData { parameters: vec![] })),
+    };
+
+    Arc::new(state)
+});
 
 #[allow(unused)]
 #[derive(Deserialize, Serialize, Clone, Copy)]
@@ -133,7 +144,7 @@ impl Segment {
     }
 }
 
-pub fn find_active_bezier_segment(curve: Curve, total_time: f32) -> Option<Segment> {
+pub fn find_active_bezier_segment(curve: &Curve, total_time: f32) -> Option<Segment> {
     if curve.segments.is_empty() {
         return None;
     }
@@ -248,35 +259,70 @@ pub struct SharedAnimationState {
     pub current_frame: Arc<Mutex<AnimationFrameData>>,
 }
 
+struct PrecomputedCurve {
+    param_id: i32,
+    curve: Curve,
+}
+
 #[allow(unsafe_op_in_unsafe_fn)]
-pub unsafe fn play_anim(anim: Animation, shared_state: SharedAnimationState) {
+pub unsafe fn play_anim(anim: Animation) {
     println!("Tryna play anim.");
+
+    let precomputed_curves: Vec<PrecomputedCurve> = anim
+        .curves
+        .into_iter()
+        .map(|curve| {
+            let c_str = std::ffi::CString::new(curve.id.as_str()).unwrap();
+            let param_id = unsafe { getParameterId(c_str.as_ptr()) };
+            PrecomputedCurve { param_id, curve }
+        })
+        .collect();
 
     std::thread::Builder::new()
         .name("animation0".to_string())
         .spawn(move || {
             let mut start_time = std::time::Instant::now();
-            let fps = anim.meta.fps;
-            let dtime = 16; // 1000.0 / fps;
+            let mut last_physics_time = std::time::Instant::now();
+
+            let sleep_ms = if anim.meta.fps > 0.0 {
+                (1000.0 / anim.meta.fps).round() as u64
+            } else {
+                16
+            };
 
             loop {
+                let now = std::time::Instant::now();
+                let delta_time = now.duration_since(last_physics_time).as_secs_f32();
+                last_physics_time = now;
+
                 let total_time = start_time.elapsed().as_secs_f32();
                 let mut next_frame = AnimationFrameData::default();
-                let curves = anim.curves.clone();
 
-                for curve in curves {
-                    if let Some(segment) = find_active_bezier_segment(curve.clone(), total_time) {
+                for item in &precomputed_curves {
+                    if let Some(segment) = find_active_bezier_segment(&item.curve, total_time) {
                         let animated_value = segment.evaluate(total_time);
-
-                        next_frame.parameters.push((
-                            getParameterId(CString::from_str(curve.id.as_str()).unwrap().as_ptr()),
-                            animated_value,
-                        ));
+                        next_frame.parameters.push((item.param_id, animated_value));
                     }
                 }
 
-                {
-                    let mut current_frame = shared_state.current_frame.lock().unwrap();
+                let physics_outputs = runtime
+                    .lock()
+                    .unwrap()
+                    .update(&next_frame.parameters, delta_time);
+
+                for (param_id, param_val) in physics_outputs {
+                    if let Some(pos) = next_frame
+                        .parameters
+                        .iter()
+                        .position(|(id, _)| *id == param_id)
+                    {
+                        next_frame.parameters[pos].1 += param_val;
+                    } else {
+                        next_frame.parameters.push((param_id, param_val));
+                    }
+                }
+
+                if let Ok(mut current_frame) = anim_state.current_frame.lock() {
                     *current_frame = next_frame;
                 }
 
@@ -288,9 +334,10 @@ pub unsafe fn play_anim(anim: Animation, shared_state: SharedAnimationState) {
                     }
                 }
 
-                std::thread::sleep(std::time::Duration::from_millis(dtime as u64));
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
             }
 
             println!("Finished anim.");
-        });
+        })
+        .unwrap();
 }
